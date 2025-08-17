@@ -124,7 +124,9 @@ def args_parse():
     parser.add_argument("--student_num_experts_per_tok", default=1, type=int)
     parser.add_argument("--student_routed_tok", default=0, type=int)
 
-    parser.add_argument("--dynamic_expert_routing_threshold", default=0.6, type=float)
+    # ENTROPIX: Entropy-based adaptive routing flags
+    parser.add_argument("--entropy_threshold", default=None, type=float)
+    parser.add_argument("--entropy_max_experts", default=None, type=int)
     
     #Added stopping text criteria
     parser.add_argument(
@@ -164,8 +166,12 @@ def generate(rank, args):
             config.routed_tok = [_ for _ in range(args.num_experts_per_tok)]
         else:
             config.routed_tok = generate_combinations(8 if "Mixtral" in args.model_name_or_path else 128, args.num_experts_per_tok)[args.routed_tok]
-    if args.decoding_method == "dynamic":
-        config.dynamic_expert_routing_threshold = args.dynamic_expert_routing_threshold
+    
+    # ENTROPIX: Wire entropy routing config (used by model forward if provided)
+    if args.entropy_threshold is not None:
+        config.entropy_threshold = args.entropy_threshold
+    if args.entropy_max_experts is not None:
+        config.entropy_max_experts = args.entropy_max_experts
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
@@ -257,8 +263,8 @@ def generate(rank, args):
         if stop_strings:
             stopping_criteria.append(StopOnSubstrings(tokenizer, stop_strings, start_pos=prompt_len))
         #---------------------------------------------------------------------------
-        
-        if args.decoding_method == "greedy" or args.decoding_method == "dynamic":
+        # ENTROPIX: remove args.decoding_method == "greedy" and add args.decoding_method == "greedy_entropy"
+        if args.decoding_method == "greedy":
             outputs = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
@@ -340,6 +346,9 @@ def generate(rank, args):
                 teacher_num_experts_per_tok=args.num_experts_per_tok,
                 student_routed_tok=MoE_mapping_student[args.student_routed_tok],
                 student_num_experts_per_tok=args.student_num_experts_per_tok,
+                # ENTROPIX: add entropy_threshold and entropy_max_experts
+                entropy_threshold=args.entropy_threshold,
+                entropy_max_experts=args.entropy_max_experts,
             )
         if args.decoding_method == "scmoe_with_sampling":
             if args.routed_tok == 0:
@@ -372,6 +381,9 @@ def generate(rank, args):
                 teacher_num_experts_per_tok=args.num_experts_per_tok,
                 student_routed_tok=MoE_mapping_student[args.student_routed_tok],
                 student_num_experts_per_tok=args.student_num_experts_per_tok,
+                # ENTROPIX: add entropy_threshold and entropy_max_experts
+                entropy_threshold=args.entropy_threshold,
+                entropy_max_experts=args.entropy_max_experts,
             )
 
         generation_text = tokenizer.batch_decode(

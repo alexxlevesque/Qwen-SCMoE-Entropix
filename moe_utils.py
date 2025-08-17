@@ -22,6 +22,9 @@ def scmoe(
     teacher_num_experts_per_tok=2,
     student_routed_tok=[0],
     student_num_experts_per_tok=1,
+    # ENTROPIX: add entropy_threshold and entropy_max_experts
+    entropy_threshold: float = None,
+    entropy_max_experts: int = None,
 ):
 
     batch_size, prefix_len = input_ids.size()
@@ -59,6 +62,9 @@ def scmoe(
             output_hidden_states=False,
             routed_tok=teacher_routed_tok,
             num_experts_per_tok=teacher_num_experts_per_tok,
+            # ENTROPIX: add entropy_threshold and entropy_max_experts
+            entropy_threshold=entropy_threshold,
+            entropy_max_experts=entropy_max_experts,
         )
         next_token_scores = outputs.logits[:, -1, :]
         next_token_scores = next_token_scores / teacher_t
@@ -76,6 +82,9 @@ def scmoe(
             output_hidden_states=False,
             routed_tok=student_routed_tok,
             num_experts_per_tok=student_num_experts_per_tok,
+            # ENTROPIX: add entropy_threshold and entropy_max_experts
+            entropy_threshold=entropy_threshold,
+            entropy_max_experts=entropy_max_experts,
         )
         next_token_logits_student = outputs_student.logits[:, -1, :]
         next_token_logits_student = next_token_logits_student / student_t
@@ -138,6 +147,9 @@ def scmoe_with_sampling(
     teacher_num_experts_per_tok=2,
     student_routed_tok=[0],
     student_num_experts_per_tok=1,
+    # ENTROPIX: add entropy_threshold and entropy_max_experts
+    entropy_threshold: float = None,
+    entropy_max_experts: int = None,
 ):
 
     batch_size, prefix_len = input_ids.size()
@@ -163,6 +175,9 @@ def scmoe_with_sampling(
             output_hidden_states=False,
             routed_tok=teacher_routed_tok,
             num_experts_per_tok=teacher_num_experts_per_tok,
+            # ENTROPIX: add entropy_threshold and entropy_max_experts
+            entropy_threshold=entropy_threshold,
+            entropy_max_experts=entropy_max_experts,
         )
         next_token_scores = outputs.logits[:, -1, :]
         next_token_scores = next_token_scores / teacher_t
@@ -180,6 +195,9 @@ def scmoe_with_sampling(
             output_hidden_states=False,
             routed_tok=student_routed_tok,
             num_experts_per_tok=student_num_experts_per_tok,
+            # ENTROPIX: add entropy_threshold and entropy_max_experts
+            entropy_threshold=entropy_threshold,
+            entropy_max_experts=entropy_max_experts,
         )
         next_token_logits_student = outputs_student.logits[:, -1, :]
         next_token_logits_student = next_token_logits_student / student_t

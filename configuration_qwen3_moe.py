@@ -195,7 +195,9 @@ class Qwen3MoeConfig(PretrainedConfig):
         output_router_logits=False,
         router_aux_loss_coef=0.001,
         routed_tok=[0, 1, 2, 3, 4, 5, 6, 7],
-        dynamic_expert_routing_threshold=1.0,       
+        # ENTROPIX: Entropy-based adaptive routing (inference-time)
+        entropy_threshold: float = None,
+        entropy_max_experts: int = None,
         mlp_only_layers=None,
         **kwargs,
     ):
@@ -232,7 +234,9 @@ class Qwen3MoeConfig(PretrainedConfig):
         self.output_router_logits = output_router_logits
         self.router_aux_loss_coef = router_aux_loss_coef
         self.routed_tok = routed_tok
-        self.dynamic_expert_routing_threshold = dynamic_expert_routing_threshold
+        # ENTROPIX: Entropy-based adaptive routing
+        self.entropy_threshold = entropy_threshold
+        self.entropy_max_experts = entropy_max_experts
         self.mlp_only_layers = [] if mlp_only_layers is None else mlp_only_layers
 
         super().__init__(

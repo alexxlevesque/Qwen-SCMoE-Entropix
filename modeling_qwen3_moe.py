@@ -228,6 +228,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
 
+        # ENTROPIX: Entropy-based adaptive routing configuration
+        self.entropy_threshold = getattr(config, "entropy_threshold", None)
+        self.entropy_max_experts = getattr(config, "entropy_max_experts", None)
+
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
@@ -239,16 +243,18 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[list[int]] = None,
-        dynamic_expert_routing_threshold: Optional[float] = None,
+        # ENTROPIX: remove dynamic_expert_routing_threshold and add entropy_threshold and entropy_max_experts
+        entropy_threshold: Optional[float] = None,
+        entropy_max_experts: Optional[int] = None,
     ) -> torch.Tensor:
         """
         SCMoE changes:
           - Allow runtime control of routing:
               * routed_tok: explicit expert rank indices to keep (e.g., [0], [0,1], [0,2], ...)
-              * num_experts_per_tok: cap for number of experts per token (used with threshold mode)
-              * dynamic_expert_routing_threshold: choose smallest prefix of experts whose cumulative prob
-                exceeds this threshold (variable K per token). If 1.0, behaves like explicit routed_tok.
-          - Use full sort over experts to enable arbitrary rank selection and thresholding.
+              * num_experts_per_tok: cap for number of experts per token
+              * entropy_threshold: entropy threshold for adaptive expert activation
+              * entropy_max_experts: maximum additional experts to activate when entropy is high
+          - Use full sort over experts to enable arbitrary rank selection and entropy-based routing.
           - Keep original Qwen normalization flag (norm_topk_prob) semantics: renormalize only if True.
         """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -278,35 +284,34 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             selected_experts_random = torch.randint(0, rand_cap, (selected_experts.shape[0], 1), device=selected_experts.device)
             selected_experts = torch.cat((selected_experts, selected_experts_random), dim=-1)
 
-        # Thresholded (dynamic) vs. explicit-rank selection
-        if dynamic_expert_routing_threshold is not None and dynamic_expert_routing_threshold != 1.0:
-            # Keep the smallest prefix of experts per token whose cumulative prob
-            # exceeds the threshold, capped by num_experts_per_tok
-            dim_size = len(routed_tok)  # authors use routed_tok length as the maximum slice base
-            cumsum = torch.cumsum(routing_weights, dim=-1)
-            threshold_indices = (cumsum > dynamic_expert_routing_threshold).sum(dim=-1)
+        # ENTROPIX: Entropy-based adaptive expert activation (layer-level)
+        if entropy_threshold is None and hasattr(self, "entropy_threshold"):
+            entropy_threshold = getattr(self, "entropy_threshold")
+        if entropy_max_experts is None and hasattr(self, "entropy_max_experts"):
+            entropy_max_experts = getattr(self, "entropy_max_experts")
 
-            new_routing_weights = torch.zeros_like(routing_weights, device=routing_weights.device)
-            for _ in range(len(new_routing_weights)):
-                if threshold_indices[_] > 0:
-                    # Keep only the leading slice needed to cross the threshold (bounded by dim_size)
-                    new_routing_weights[_][: dim_size - threshold_indices[_] + 1] = routing_weights[_][: dim_size - threshold_indices[_] + 1]
-                else:
-                    new_routing_weights[_] = routing_weights[_]
+        # ENTROPIX: use entropy-based adaptive expert activation
+        use_entropy = (
+            entropy_threshold is not None and entropy_max_experts is not None and entropy_max_experts > 0
+        )
+        # ENTROPIX: use entropy-based adaptive expert activation
+        if use_entropy:
+            # Compute mean entropy across tokens
+            probs = routing_weights.clamp_min(1e-12)
+            entropy_per_token = (-probs * probs.log()).sum(dim=-1)
+            layer_entropy = entropy_per_token.mean()
 
-            break_tag = 0
-            for _ in range(num_experts_per_tok):
-                # If the remaining tail is all zeros at step _ , trim to the used prefix
-                if new_routing_weights[:, _ :].sum() == 0:
-                    routing_weights = new_routing_weights[:, : _]
-                    selected_experts = selected_experts[:, : _]
-                    break_tag = 1
-                    break
-            if break_tag == 0:
-                routing_weights = new_routing_weights
-                # selected_experts is already aligned
+            base_positions = routed_tok if routed_tok is not None else list(range(self.top_k))
+            base_is_contiguous = base_positions == list(range(len(base_positions)))
+            if layer_entropy > entropy_threshold and base_is_contiguous:
+                base_k = len(base_positions)
+                max_k = min(base_k + int(entropy_max_experts), self.num_experts)
+                routing_weights = routing_weights[:, :max_k]
+                selected_experts = selected_experts[:, :max_k]
+            else:
+                routing_weights = routing_weights[:, base_positions]
+                selected_experts = selected_experts[:, base_positions]
         else:
-            # Explicit ranks path: pick expert ranks by routed_tok (e.g., [0], [0,1], [0,2], etc.)
             routing_weights = routing_weights[:, routed_tok]
             selected_experts = selected_experts[:, routed_tok]
 
@@ -430,7 +435,9 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
             SCMoE additions (passed via kwargs.get to mirror Mixtral SCMoE):
               - num_experts_per_tok: Optional[int]
               - routed_tok: Optional[List[int]]
-              - dynamic_expert_routing_threshold: Optional[float]
+              # ENTROPIX: add entropy_threshold and entropy_max_experts, remove dynamic_expert_routing_threshold
+              - entropy_threshold: Optional[float]
+              - entropy_max_experts: Optional[int]
         """
         residual = hidden_states
 
@@ -458,7 +465,9 @@ class Qwen3MoeDecoderLayer(GradientCheckpointingLayer):
                 hidden_states,
                 kwargs.get("num_experts_per_tok"),
                 kwargs.get("routed_tok"),
-                kwargs.get("dynamic_expert_routing_threshold"),
+                # ENTROPIX: add entropy_threshold and entropy_max_experts, remove dynamic_expert_routing_threshold
+                kwargs.get("entropy_threshold", self.mlp.entropy_threshold),
+                kwargs.get("entropy_max_experts", self.mlp.entropy_max_experts),
             )
         else:
             hidden_states = self.mlp(hidden_states)
@@ -560,7 +569,9 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
         # If not provided, layers fall back to their default top-K behavior.
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[list[int]] = None,
-        dynamic_expert_routing_threshold: Optional[float] = None,
+        # ENTROPIX: add entropy_threshold and entropy_max_experts, remove dynamic_expert_routing_threshold
+        entropy_threshold: Optional[float] = None,
+        entropy_max_experts: Optional[int] = None,
         # ----------------------------------------------------------------------
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
@@ -610,7 +621,9 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 # --------- SCMoE: thread routing knobs to each layer (same names) ---------
                 num_experts_per_tok=num_experts_per_tok,
                 routed_tok=routed_tok,
-                dynamic_expert_routing_threshold=dynamic_expert_routing_threshold,
+                # ENTROPIX: add entropy_threshold and entropy_max_experts, remove dynamic_expert_routing_threshold
+                entropy_threshold=entropy_threshold if entropy_threshold is not None else self.config.entropy_threshold,
+                entropy_max_experts=entropy_max_experts if entropy_max_experts is not None else self.config.entropy_max_experts,
                 # -------------------------------------------------------------------------
                 **kwargs,   # keep passing attention / backend kwargs unchanged
             )
@@ -751,7 +764,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
         # If not provided, they fall back to config values.        
         num_experts_per_tok: Optional[int] = None,
         routed_tok: Optional[list[int]] = None,
-        dynamic_expert_routing_threshold: Optional[float] = None,
+        # ENTROPIX: add entropy_threshold and entropy_max_experts, remove dynamic_expert_routing_threshold
+        entropy_threshold: Optional[float] = None,
+        entropy_max_experts: Optional[int] = None,
         # -----------------------------------------------------------------------
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
@@ -796,7 +811,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel, GenerationMixin):
             # -------- SCMoE: thread routing knobs with config fallbacks (same names/structure) --------
             num_experts_per_tok=num_experts_per_tok if num_experts_per_tok else self.config.num_experts_per_tok,
             routed_tok=routed_tok if routed_tok else self.config.routed_tok,
-            dynamic_expert_routing_threshold=dynamic_expert_routing_threshold if dynamic_expert_routing_threshold else self.config.dynamic_expert_routing_threshold,
+            # ENTROPIX: add entropy_threshold and entropy_max_experts, remove dynamic_expert_routing_threshold
+            entropy_threshold=entropy_threshold if entropy_threshold is not None else self.config.entropy_threshold,
+            entropy_max_experts=entropy_max_experts if entropy_max_experts is not None else self.config.entropy_max_experts,
             # ------------------------------------------------------------------------------------------------
             **kwargs,
         )
